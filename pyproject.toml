@@ -1,21 +1,17 @@
-[project]
+[tool.poetry]
 name = "eops"
 version = "0.1.0"
-description = "a quant package for Eops"
-authors = [
-    {name = "ops"}
-]
-license = {text = "mit"}
+description = "A quantitative trading library for my crypto exchange."
+authors = ["ops"]
+license = "MIT"
 readme = "README.md"
-requires-python = "^3.9"
-dependencies = [
-    "typer[all] (>=0.16.0,<0.17.0)"
-]
+homepage = "https://github.com/ops3000/eops" 
+repository = "https://github.com/ops3000/eops" 
+keywords = ["quant", "trading", "crypto", "exchange", "finance"] 
 
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.poetry.dependencies]
+python = "^3.9"
+typer = {extras = ["all"], version = "^0.9.0"}
 
 [tool.poetry.scripts]
 eops = "eops.cli:main_app"
