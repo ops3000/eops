@@ -21,6 +21,7 @@ build/
 dist/
 *.egg-info/
 ops/
+data/
 
 # Secrets - 非常重要！
 *.env
