@@ -1,0 +1,1594 @@
+=== 文件树结构 ===
+eops/
+    __init__.py
+    cli.py
+    core/
+        backtest/
+        __init__.py
+        executor.py
+        updater.py
+    backtester.py
+    engine.py
+    event.py
+    exchange.py
+        handler/
+        __init__.py
+        decider.py
+        event_handler.py
+        executor.py
+        updater.py
+    portfolio.py
+    sim_exchange.py
+    strategy.py
+    data/
+        clients/
+        __init__.py
+        base.py
+        binance.py
+        okx.py
+    downloader.py
+    utils/
+    config_loader.py
+    logger.py
+
+=== 文件内容 ===
+
+__init__.py
+```py
+__version__ = "0.1.0"
+```
+
+cli.py
+```py
+# eops/cli.py
+import typer
+from pathlib import Path
+from .utils.config_loader import load_config_from_file
+from .core.engine import LiveEngine
+from .core.backtester import BacktestEngine
+from .data.downloader import download_ohlcv_data, fix_ohlcv_data
+from .utils.logger import log
+from . import __version__
+import sys
+sys.path.insert(0, str(Path.cwd()))
+
+main_app = typer.Typer(help="Eops - A quantitative trading framework.")
+data_app = typer.Typer(name="data", help="Tools for managing historical data.")
+main_app.add_typer(data_app)
+
+@main_app.command()
+def run(
+    config_file: Path = typer.Argument(..., help="Path to the Python configuration file.", exists=True),
+    backtest: bool = typer.Option(False, "--backtest", "-b", help="Run in backtesting mode."),
+    report_path: Path = typer.Option(None, "--report", "-r", help="Path to save the backtest report HTML file."),
+):
+    """
+    Run a trading strategy from a configuration file.
+    """
+    log.info(f"🚀 Starting Eops runner...")
+    log.info(f"⚙️  Config file: {config_file}")
+
+    try:
+        config = load_config_from_file(config_file)
+        
+        if backtest:
+            typer.secho("MODE: Backtesting", fg=typer.colors.YELLOW)
+            engine = BacktestEngine(config, report_path=report_path)
+            engine.run()
+        else:
+            typer.secho("MODE: Live Trading", fg=typer.colors.GREEN)
+            engine = LiveEngine(config)
+            engine.run()
+            
+    except (FileNotFoundError, AttributeError, ImportError, ValueError) as e:
+        log.error(f"🔥 Error loading configuration: {e}")
+        typer.secho(f"🔥 Error loading configuration: {e}", fg=typer.colors.RED, err=True)
+    except Exception as e:
+        log.error(f"🔥 An unexpected application error occurred: {e}", exc_info=True)
+        typer.secho(f"🔥 An unexpected application error occurred: {e}", fg=typer.colors.RED, err=True)
+
+
+@data_app.command("download")
+def download_data_command(
+    exchange: str = typer.Option("binance", "--exchange", "-e", help="Exchange ID (e.g., 'binance', 'okx')."),
+    symbol: str = typer.Option("BTC/USDT", "--symbol", "-s", help="Trading symbol (e.g., 'BTC/USDT')."),
+    timeframe: str = typer.Option("1h", "--timeframe", "-t", help="Timeframe (e.g., '1m', '5m', '1h', '1d')."),
+    since: str = typer.Option(..., "--since", help="Start date in YYYY-MM-DD format."),
+    until: str = typer.Option(None, "--until", help="End date in YYYY-MM-DD format (optional)."),
+    output: Path = typer.Option(None, "--output", "-o", help="Output file path (CSV). Defaults to './data/EXCHANGE_SYMBOL_TF.csv'.")
+):
+    """
+    Download historical OHLCV data from an exchange.
+    """
+    if not output:
+        # Create a default file name if not provided
+        safe_symbol = symbol.replace("/", "_")
+        output = Path(f"./data/{exchange}_{safe_symbol}_{timeframe}.csv")
+
+    typer.echo(f"📥 Starting data download...")
+    typer.echo(f"   - Exchange: {exchange}")
+    typer.echo(f"   - Symbol: {symbol}")
+    typer.echo(f"   - Timeframe: {timeframe}")
+    typer.echo(f"   - Since: {since}")
+    if until:
+        typer.echo(f"   - Until: {until}")
+    typer.echo(f"   - Output file: {output}")
+
+    download_ohlcv_data(
+        exchange_id=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
+        since=since,
+        output_path=output,
+        until=until
+    )
+
+@data_app.command("fix")
+def fix_data_command(
+    file: Path = typer.Argument(..., help="Path to the CSV data file to fix.", exists=True, readable=True, writable=True)
+):
+    """
+    Checks for missing data points in a CSV file and fetches them.
+    The filename must be in 'exchange_symbol_timeframe.csv' format.
+    Example: binance_BTC_USDT_1h.csv
+    """
+    typer.echo(f"🛠️  Attempting to fix data file: {file}")
+    fix_ohlcv_data(file)
+
+@main_app.command()
+def info():
+    """Displays information about eops."""
+    typer.echo(f"Eops Quant Trading Library v{__version__}")
+
+if __name__ == "__main__":
+    main_app()
+```
+
+core/backtest/__init__.py
+```py
+
+```
+
+core/backtest/executor.py
+```py
+# eops/core/backtest/executor.py
+from typing import Set, TYPE_CHECKING
+
+from ..handler.executor import BaseExecutor
+from ..event import Event, EventType, event_bus
+from ..sim_exchange import SimulatedExchange
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BacktestExecutor(BaseExecutor):
+    """
+    An executor for backtesting. It subscribes to ORDER events and interacts
+    with the SimulatedExchange to execute trades. It then produces FILL events.
+    """
+    def __init__(self, strategy: 'BaseStrategy'):
+        super().__init__(strategy)
+        # The executor needs direct access to the exchange from the strategy's context
+        self.exchange: SimulatedExchange = self.strategy.context['exchange']
+
+    @property
+    def subscribed_events(self) -> Set[EventType]:
+        return {EventType.ORDER}
+
+    def process(self, event: Event):
+        """Processes an ORDER event and simulates its execution."""
+        order_data = event.data
+        self.log.debug(f"BacktestExecutor received ORDER event: {order_data}")
+
+        try:
+            # Call the simulated exchange to execute the order
+            trade_result = self.exchange.create_market_order(
+                symbol=order_data.get('symbol'),
+                side=order_data.get('side'),
+                amount=order_data.get('amount')
+            )
+            
+            # If execution is successful, create and dispatch a FILL event
+            if trade_result:
+                fill_event = Event(event_type=EventType.FILL, data=trade_result)
+                self.log.debug(f"Dispatching FILL event: {fill_event}")
+                event_bus.put(fill_event)
+
+        except ValueError as e:
+            # Handle errors like insufficient funds
+            self.log.error(f"Order execution failed for {order_data.get('symbol')}: {e}")
+        except Exception as e:
+            self.log.error(f"An unexpected error occurred during order execution: {e}", exc_info=True)
+```
+
+core/backtest/updater.py
+```py
+# eops/core/backtest/updater.py
+import pandas as pd
+from typing import TYPE_CHECKING
+
+from ..handler.updater import BaseUpdater
+from ..event import Event, EventType, event_bus
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BacktestUpdater(BaseUpdater):
+    """
+    An updater for backtesting. It reads a historical data file and puts
+    MarketEvents onto the event bus in chronological order.
+    """
+    def __init__(self, strategy: 'BaseStrategy', data_path: str):
+        super().__init__(strategy)
+        self.data_path = data_path
+        try:
+            self.data = pd.read_csv(self.data_path, parse_dates=['time'], index_col='time')
+            self.log.info(f"BacktestUpdater loaded {len(self.data)} data points from {self.data_path}")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Data file not found at {self.data_path}")
+
+    def _run(self):
+        """The main data streaming loop."""
+        self.log.info(f"BacktestUpdater starting to stream historical data from {self.data.index[0]} to {self.data.index[-1]}...")
+        for index, row in self.data.iterrows():
+            if not self.active:
+                break
+            
+            event_data = row.to_dict()
+            event_data['time'] = index
+
+            market_event = Event(event_type=EventType.MARKET, data=event_data)
+            event_bus.put(market_event)
+
+        self.log.info("BacktestUpdater finished streaming all historical data.")
+        # We can stop the engine once the updater is done.
+        # A more robust way would be a special "END_OF_DATA" event.
+        # For now, the engine's run loop condition will handle this.
+```
+
+core/backtester.py
+```py
+# eops/core/backtester.py
+import pandas as pd
+import quantstats as qs
+from typing import Dict, Any
+
+from .engine import BaseEngine
+from .event import event_bus, EventType
+from .portfolio import Portfolio
+from .sim_exchange import SimulatedExchange
+from eops.utils.logger import log
+from queue import Empty
+
+class BacktestEngine(BaseEngine):
+    """
+    The engine for backtesting strategies against historical data using
+    the full UADE event-driven architecture.
+    
+    Its main responsibilities are:
+    1. Setting up the backtest environment (Portfolio, SimulatedExchange).
+    2. Creating a shared context for all strategy components.
+    3. Running a specialized event loop that manages the simulation's clock
+       and terminates when historical data is exhausted.
+    4. Generating a performance report at the end.
+    """
+    def __init__(self, config: Dict[str, Any], report_path=None):
+        log.info("🔧 Initializing UADE-based Backtest Engine...")
+
+        # 1. Backtest-specific setup from configuration
+        self.report_path = report_path
+        
+        data_path = config.get("backtest_data_path")
+        if not data_path:
+             raise ValueError("`BACKTEST_DATA_PATH` must be specified in the config for backtesting.")
+        
+        try:
+            # Load the entire dataset once for the simulated world
+            full_data = pd.read_csv(data_path, parse_dates=['time'], index_col='time')
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Data file not found at {data_path}")
+        
+        # 2. Setup simulated environment components
+        engine_params = config.get("engine_params", {})
+        initial_cash = float(engine_params.get("initial_cash", 10000.0))
+        fee_rate = float(engine_params.get("fee_rate", 0.001))
+
+        self.portfolio = Portfolio(initial_cash=initial_cash)
+        self.exchange = SimulatedExchange(data=full_data, portfolio=self.portfolio, fee_rate=fee_rate)
+
+        # 3. Prepare a comprehensive context for the strategy and its components
+        # This context allows any component to access the backtest environment.
+        context = {
+            "exchange": self.exchange,
+            "portfolio": self.portfolio,
+            "full_data": full_data,
+            "backtest_data_path": data_path
+        }
+        
+        strategy_class = config["strategy_class"]
+        strategy_params = config.get("strategy_params", {})
+
+        # Initialize the BaseEngine, which will in turn initialize the strategy
+        # with the provided context and params.
+        super().__init__(strategy_class, context, strategy_params)
+        
+        # Keep a direct reference to updaters for the run loop condition
+        self.updaters = self.strategy.updaters
+
+        log.info("✅ Backtest Engine initialization complete.")
+
+    def run(self):
+        """
+        Overrides BaseEngine.run() to handle the specific lifecycle of a backtest.
+        This includes managing the simulated exchange's clock and determining when
+        the backtest is complete.
+        """
+        log.info(f"🚀 Starting backtest...")
+        self.running = True
+        self.start_event_sources() # This will start all updaters
+        
+        # The loop continues as long as any updater thread is alive,
+        # or there are still events in the queue to be processed after updaters finish.
+        while any(u._thread.is_alive() for u in self.updaters) or not event_bus.empty():
+            try:
+                event = event_bus.get(block=True, timeout=1.0)
+            except Empty:
+                # If the queue is empty and all updater threads are dead, we're done.
+                if not any(u._thread.is_alive() for u in self.updaters):
+                    break
+                continue
+
+            if event:
+                # Before dispatching, we must advance the simulated world's state.
+                if event.type == EventType.MARKET:
+                    current_time = event.data['time']
+                    
+                    # Advance the simulated exchange's clock to the event's time
+                    try:
+                        idx = self.exchange.data.index.get_loc(current_time)
+                        self.exchange.tick(idx)
+                    except KeyError:
+                        log.error(f"Could not find time {current_time} in data index. Skipping tick.")
+                        continue
+                    
+                    # Update portfolio equity at each market tick.
+                    # This could be moved to a dedicated PortfolioHandler for more complex scenarios.
+                    symbol = self.strategy.params.get("symbol", "UNKNOWN_SYMBOL")
+                    price = self.exchange._get_current_price(symbol)
+                    self.portfolio.update_equity(current_time, {symbol: price})
+                
+                self.dispatch(event)
+        
+        self.stop()
+        self._generate_report()
+
+    def _generate_report(self):
+        """Generates and prints a performance report using quantstats."""
+        log.info("📊 Generating performance report...")
+        if not self.portfolio.equity_curve:
+            log.warning("Equity curve is empty. No trades were made. Skipping report generation.")
+            return
+
+        equity_df = pd.DataFrame(self.portfolio.equity_curve).set_index('timestamp')
+        returns = equity_df['equity'].pct_change().dropna()
+        
+        if returns.empty:
+            log.warning("No returns were generated. Skipping report.")
+            return
+
+        log.info("\n--- Backtest Summary ---")
+        try:
+            # Use the newer `display` function if available
+            qs.stats.display(returns)
+        except AttributeError:
+            # Fallback for older quantstats versions
+            log.info(f"Sharpe Ratio: {qs.stats.sharpe(returns):.2f}")
+            log.info(f"CAGR:               {qs.stats.cagr(returns)*100:.2f}%")
+            log.info(f"Max Drawdown: {qs.stats.max_drawdown(returns)*100:.2f}%")
+        log.info("----------------------\n")
+
+        if self.report_path:
+            try:
+                qs.reports.html(returns, output=str(self.report_path), title=f'Eops Strategy Report')
+                log.info(f"💾 Full HTML report saved to: {self.report_path}")
+            except Exception as e:
+                log.error(f"Failed to generate HTML report: {e}", exc_info=True)
+```
+
+core/engine.py
+```py
+# eops/core/engine.py
+from abc import ABC, abstractmethod
+from queue import Empty
+from collections import defaultdict
+from typing import Dict, Any, List, Type
+
+# --- Corrected Imports ---
+# BaseEngine no longer needs to know about the specific base classes of handlers.
+# It only interacts with the instantiated processors collected from the strategy.
+from .event import event_bus, Event, EventType
+from .strategy import BaseStrategy
+from eops.utils.logger import log
+
+class BaseEngine(ABC):
+    """
+    Abstract Base Class for all engines in the UADE architecture.
+    
+    The engine instantiates the strategy, registers all its processors
+    (EventHandlers, Deciders, Executors), starts its data sources (Updaters),
+    and runs the main event loop.
+    """
+    def __init__(self, strategy_class: Type[BaseStrategy], context: Dict[str, Any], params: Dict[str, Any]):
+        """
+        Initializes the engine and the strategy with its full pipeline.
+        """
+        self.strategy = strategy_class(context=context, params=params)
+        self.handler_map = self._create_handler_map()
+        self.running = False
+
+    def _create_handler_map(self) -> Dict[EventType, List[Any]]:
+        """
+        Creates a mapping from EventType to a list of processors that subscribe to it.
+        It collects all processors (EventHandlers, Deciders, Executors) from the strategy.
+        """
+        handler_map = defaultdict(list)
+        
+        # Gather all components that process events from the strategy pipeline
+        all_processors = (
+            self.strategy.event_handlers + 
+            self.strategy.deciders + 
+            self.strategy.executors
+        )
+        
+        for processor in all_processors:
+            # We rely on duck typing: as long as it has .subscribed_events and .process, it's a processor.
+            for event_type in processor.subscribed_events:
+                handler_map[event_type].append(processor)
+        
+        log.debug("Handler map created:")
+        for event_type, processor_list in handler_map.items():
+            processor_names = [p.__class__.__name__ for p in processor_list]
+            log.debug(f"  - {event_type.name}: {processor_names}")
+            
+        return handler_map
+
+    def start_event_sources(self):
+        """Starts all updaters defined in the strategy."""
+        if not self.strategy.updaters:
+            log.warning("No updaters found in the strategy. The engine will not receive any data.")
+            return
+            
+        for updater in self.strategy.updaters:
+            updater.start()
+
+    def run(self):
+        """
+        The main event loop. This method blocks until the engine is stopped.
+        """
+        log.info(f"🚀 Starting engine '{self.__class__.__name__}'...")
+        self.running = True
+        self.start_event_sources()
+        
+        while self.running:
+            try:
+                event = event_bus.get(block=True, timeout=1.0)
+            except Empty:
+                continue
+
+            if event:
+                self.dispatch(event)
+        
+        log.info(f"👋 Engine '{self.__class__.__name__}' has stopped.")
+
+    def dispatch(self, event: Event):
+        """Dispatches an event to all registered processors."""
+        if event.type in self.handler_map:
+            log.debug(f"Dispatching event: {event}")
+            processors = self.handler_map[event.type]
+            # The execution order for processors subscribing to the same event
+            # is determined by their order in the strategy's component lists.
+            for processor in processors:
+                try:
+                    processor.process(event)
+                except Exception as e:
+                    log.error(f"Error in processor '{processor.__class__.__name__}' while processing {event.type.name} event: {e}", exc_info=True)
+
+    def stop(self):
+        """Stops the engine's event loop and all updaters gracefully."""
+        log.info(f"🛑 Stopping engine '{self.__class__.__name__}'...")
+        self.running = False
+        # Add a defensive check to ensure strategy and updaters were initialized
+        if hasattr(self, 'strategy') and hasattr(self.strategy, 'updaters'):
+             for updater in self.strategy.updaters:
+                updater.stop()
+
+# ====================================================================
+#  Live Engine Definition (Placeholder for real-time trading)
+# ====================================================================
+
+class LiveEngine(BaseEngine):
+    """
+    The engine for running strategies in a live, event-driven environment.
+    Its specific updaters (e.g., WebSocket clients) and executors need to be implemented.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        exchange_class = config.get("exchange_class")
+        if not exchange_class:
+            raise ValueError("`EXCHANGE_CLASS` must be specified in the config for live trading.")
+
+        exchange_params = config.get("exchange_params", {})
+        exchange = exchange_class(params=exchange_params)
+        
+        context = {"exchange": exchange}
+        strategy_class = config["strategy_class"]
+        strategy_params = config.get("strategy_params", {})
+
+        super().__init__(strategy_class, context, strategy_params)
+
+    def start_event_sources(self):
+        # This is where you would implement live data sources.
+        # For example:
+        # from .live import BinanceWebsocketUpdater
+        # self.strategy.updaters.append(BinanceWebsocketUpdater(self.strategy, ...))
+        # super().start_event_sources()
+        log.warning("LiveEngine.start_event_sources() is not yet implemented. Live trading will not receive market data.")
+        # We call the parent method in case any default updaters were added.
+        super().start_event_sources()
+```
+
+core/event.py
+```py
+# eops/core/event.py
+from enum import Enum
+from typing import Any, Dict
+from queue import Queue
+
+class EventType(Enum):
+    """
+    Enumeration of all possible event types in the system.
+    """
+    # Market Events
+    MARKET = 'MARKET'         # A new kline/bar is available
+    
+    # Signal Events
+    SIGNAL = 'SIGNAL'         # A strategy logic has generated a trading signal
+    
+    # Order Lifecycle Events
+    ORDER = 'ORDER'           # A request to place a new order
+    FILL = 'FILL'             # An order has been filled (or partially filled)
+    
+    # Informational Events
+    HEARTBEAT = 'HEARTBEAT'   # A regular time-based event, e.g., every second
+    # Future events: NEWS, ORDER_STATUS_UPDATE, etc.
+
+
+class Event:
+    """
+    Base class for all event objects. It defines the type and optional data payload.
+    """
+    def __init__(self, event_type: EventType, data: Any = None):
+        """
+        Initializes the event.
+        
+        Args:
+            event_type: The type of the event, from the EventType enum.
+            data: A dictionary payload containing event-specific information.
+        """
+        self.type = event_type
+        self.data: Dict[str, Any] = data if data is not None else {}
+
+    def __str__(self):
+        # A more informative string representation
+        # Truncate long data previews
+        items_preview = list(self.data.items())[:3]
+        data_preview = ', '.join(f"{k}={v}" for k, v in items_preview)
+        if len(self.data) > 3:
+            data_preview += ', ...'
+        return f"Event(type={self.type.name}, data={{{data_preview}}})"
+
+
+# --- Global Event Bus ---
+# The central message queue for the entire application.
+event_bus = Queue()
+```
+
+core/exchange.py
+```py
+# eops/core/exchange.py
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List
+
+class BaseExchange(ABC):
+    """
+    Abstract Base Class for all exchange implementations.
+    The user must implement a class that inherits from this one.
+    eops engines will only interact with objects of this type.
+    """
+
+    def __init__(self, params: Dict[str, Any]):
+        """
+        Initialize the exchange connection.
+        'params' will be passed from the configuration file.
+        e.g., {'api_key': '...', 'secret_key': '...'}
+        """
+        self.params = params
+        self.connect()
+
+    @abstractmethod
+    def connect(self):
+        """
+        Implement the logic to connect to the exchange API.
+        This is called during initialization.
+        """
+        pass
+
+    @abstractmethod
+    def get_klines(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        """
+        Fetch Kline/OHLCV data.
+        Should return a list of dictionaries, e.g.:
+        [{'time': 1672531200000, 'open': 16500, 'high': 16550, 'low': 16480, 'close': 16520, 'volume': 100}, ...]
+        """
+        pass
+
+    @abstractmethod
+    def get_position(self, symbol: str) -> Dict[str, float]:
+        """
+        Fetch current position for a symbol.
+        Should return a dictionary, e.g.:
+        {'long': 1.5, 'short': 0.0}
+        """
+        pass
+
+    @abstractmethod
+    def get_balance(self) -> Dict[str, float]:
+        """
+        Fetch account balance.
+        Should return a dictionary, e.g.:
+        {'total': 10000.0, 'available': 8000.0}
+        """
+        pass
+    
+    @abstractmethod
+    def create_market_order(self, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+        """
+        Create a market order.
+        
+        Args:
+            symbol (str): The trading symbol, e.g., 'BCH/USDT'.
+            side (str): 'buy' or 'sell'.
+            amount (float): The quantity to trade.
+
+        Returns:
+            A dictionary representing the order result, e.g.:
+            {'id': '12345', 'status': 'filled', 'price': 350.5, 'amount': 0.1}
+        """
+        pass
+```
+
+core/handler/__init__.py
+```py
+# eops/core/handler/__init__.py
+
+from .updater import BaseUpdater
+from .event_handler import BaseEventHandler
+from .decider import BaseDecider
+from .executor import BaseExecutor
+
+# You can define a common base class if you see a lot of repetition,
+# but for now, keeping them separate emphasizes their distinct roles.
+
+__all__ = [
+    "BaseUpdater",
+    "BaseEventHandler",
+    "BaseDecider",
+    "BaseExecutor"
+]
+```
+
+core/handler/decider.py
+```py
+# eops/core/handler/decider.py
+from abc import ABC, abstractmethod
+from typing import Set, TYPE_CHECKING
+
+from ..event import Event, EventType
+from eops.utils.logger import log
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BaseDecider(ABC):
+    """
+    Abstract Base Class for deciders.
+    
+    Deciders are the 'brain' of the pipeline. They consume raw or processed
+    data events and apply the core strategy logic to make trading decisions,
+    resulting in the creation of ORDER events.
+    """
+    def __init__(self, strategy: 'BaseStrategy'):
+        self.strategy = strategy
+        self.log = log
+
+    @property
+    @abstractmethod
+    def subscribed_events(self) -> Set[EventType]:
+        """Returns the set of EventTypes this decider is interested in."""
+        pass
+
+    @abstractmethod
+    def process(self, event: Event):
+        """The core logic to process an event and make a decision."""
+        pass
+```
+
+core/handler/event_handler.py
+```py
+# eops/core/handler/event_handler.py
+from abc import ABC, abstractmethod
+from typing import Set, TYPE_CHECKING
+
+from ..event import Event, EventType
+from eops.utils.logger import log
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BaseEventHandler(ABC):
+    """
+    Abstract Base Class for event handlers.
+    
+    Event handlers are the 'processing' stage of the pipeline. They consume
+    raw data events, perform transformations or calculations (like creating
+    indicators), and may produce new, enriched events.
+    """
+    def __init__(self, strategy: 'BaseStrategy'):
+        self.strategy = strategy
+        self.log = log
+
+    @property
+    @abstractmethod
+    def subscribed_events(self) -> Set[EventType]:
+        """Returns the set of EventTypes this handler is interested in."""
+        pass
+
+    @abstractmethod
+    def process(self, event: Event):
+        """The core logic to process a subscribed event."""
+        pass
+```
+
+core/handler/executor.py
+```py
+# eops/core/handler/executor.py
+from abc import ABC, abstractmethod
+from typing import Set, TYPE_CHECKING
+
+from ..event import Event, EventType
+from eops.utils.logger import log
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BaseExecutor(ABC):
+    """
+    Abstract Base Class for executors.
+    
+    Executors are the 'hands' of the pipeline. They consume ORDER events
+    and are responsible for interacting with the external trading venue
+    (e.g., a real exchange or a simulated one). They may produce FILL
+    events as a result.
+    """
+    def __init__(self, strategy: 'BaseStrategy'):
+        self.strategy = strategy
+        self.log = log
+
+    @property
+    @abstractmethod
+    def subscribed_events(self) -> Set[EventType]:
+        """Returns the set of EventTypes this executor is interested in."""
+        # Typically, this will be {EventType.ORDER}
+        pass
+
+    @abstractmethod
+    def process(self, event: Event):
+        """The core logic to execute an order event."""
+        pass
+```
+
+core/handler/updater.py
+```py
+# eops/core/handler/updater.py
+from abc import ABC, abstractmethod
+import threading
+from typing import TYPE_CHECKING
+from eops.utils.logger import log
+
+if TYPE_CHECKING:
+    from ..strategy import BaseStrategy
+
+class BaseUpdater(ABC):
+    """
+    Abstract Base Class for all data updaters.
+    
+    Updaters are the starting point of the pipeline. They are responsible for
+    fetching raw data from an external source (e.g., exchange API, websocket)
+    and putting it onto the event bus as events.
+    """
+    def __init__(self, strategy: 'BaseStrategy'):
+        self.strategy = strategy
+        self.log = log
+        self.active = False
+        self._thread: threading.Thread
+
+    @abstractmethod
+    def _run(self):
+        """The main loop for the updater, which will be run in a thread."""
+        pass
+
+    def start(self):
+        """Starts the updater's _run loop in a new daemon thread."""
+        self.log.info(f"Starting updater '{self.__class__.__name__}'...")
+        self.active = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stops the updater's loop gracefully."""
+        self.log.info(f"Stopping updater '{self.__class__.__name__}'...")
+        self.active = False
+```
+
+core/portfolio.py
+```py
+# eops/core/portfolio.py
+from typing import List, Dict, Any
+from eops.utils.logger import log # <-- 导入 logger
+
+class Portfolio:
+    """
+    Manages the state of our account during a backtest, including cash,
+    positions, and equity.
+    """
+    def __init__(self, initial_cash: float = 10000.0):
+        self.initial_cash = initial_cash
+        self.cash = initial_cash
+        self.positions: Dict[str, float] = {}  # {'BCH/USDT': 1.5}
+        self.trades: List[Dict[str, Any]] = []
+        self.equity_curve: List[Dict[str, Any]] = []
+
+    def get_position_value(self, symbol: str) -> float:
+        """Returns the quantity of a held asset."""
+        return self.positions.get(symbol, 0.0)
+
+    def record_trade(self, timestamp: Any, symbol: str, side: str, amount: float, price: float, fee: float):
+        """
+        Records a trade and updates cash and positions.
+        """
+        cost = amount * price
+        
+        if side == 'buy':
+            self.cash -= (cost + fee)
+            self.positions[symbol] = self.get_position_value(symbol) + amount
+        elif side == 'sell':
+            self.cash += (cost - fee)
+            self.positions[symbol] = self.get_position_value(symbol) - amount
+        
+        trade_record = {
+            "timestamp": timestamp,
+            "symbol": symbol,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "fee": fee
+        }
+        self.trades.append(trade_record)
+        log.info(f"TRADE: {side.upper()} {amount} {symbol} @ {price:.2f} | Fee: {fee:.4f} | Cash: {self.cash:.2f}")
+
+    def update_equity(self, timestamp: Any, current_prices: Dict[str, float]):
+        """
+        Calculates the total value of the portfolio at a point in time.
+        """
+        market_value = 0.0
+        for symbol, quantity in self.positions.items():
+            if quantity != 0:
+                market_value += quantity * current_prices.get(symbol, 0)
+        
+        total_equity = self.cash + market_value
+        
+        self.equity_curve.append({
+            "timestamp": timestamp,
+            "equity": total_equity
+        })
+```
+
+core/sim_exchange.py
+```py
+# eops/core/sim_exchange.py
+from typing import Dict, Any, List
+import pandas as pd
+from .exchange import BaseExchange
+from .portfolio import Portfolio
+
+class SimulatedExchange(BaseExchange):
+    """
+    A simulated exchange for backtesting. It uses historical data to fill orders.
+    """
+    def __init__(self, data: pd.DataFrame, portfolio: Portfolio, fee_rate: float):
+        self.data = data
+        self.portfolio = portfolio
+        self.fee_rate = fee_rate
+        self._current_index = -1
+        self._current_tick: pd.Series = None # Explicitly type hint as a Series
+
+    def connect(self):
+        pass
+
+    def tick(self, index: int):
+        """Advances the simulation to the next data point."""
+        if index < 0 or index >= len(self.data):
+            raise IndexError("Tick index is out of bounds for the provided data.")
+        self._current_index = index
+        self._current_tick = self.data.iloc[self._current_index]
+
+    def _get_current_price(self, symbol: str) -> float:
+        if self._current_tick is None:
+            raise ValueError("Simulation has not started. Call tick() first.")
+        # Assumes the 'close' price is what we trade on.
+        return self._current_tick['close']
+    
+    def get_klines(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        if self._current_index < 0:
+            return []
+        
+        start_index = max(0, self._current_index - limit + 1)
+        end_index = self._current_index + 1
+        
+        # When converting to dict, we need to bring the index back as a 'time' column
+        kline_df = self.data.iloc[start_index:end_index]
+        kline_df = kline_df.reset_index()
+        # Ensure column name is 'time'
+        kline_df = kline_df.rename(columns={'index': 'time'}) 
+        return kline_df.to_dict('records')
+
+    def get_position(self, symbol: str) -> Dict[str, float]:
+        amount = self.portfolio.get_position_value(symbol)
+        return {'long': amount, 'short': 0.0}
+
+    def get_balance(self) -> Dict[str, float]:
+        last_equity = self.portfolio.equity_curve[-1]['equity'] if self.portfolio.equity_curve else self.portfolio.initial_cash
+        return {'total': last_equity, 'available': self.portfolio.cash}
+
+    def create_market_order(self, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+        """Simulates the execution of a market order."""
+        if self._current_tick is None:
+            raise ValueError("Cannot create order, simulation tick has not been set.")
+
+        price = self._get_current_price(symbol)
+        cost = amount * price
+        fee = cost * self.fee_rate
+        
+        if side == 'buy':
+            if self.portfolio.cash < cost + fee:
+                raise ValueError(f"Insufficient funds to buy {amount} {symbol}.")
+        elif side == 'sell':
+            if self.portfolio.get_position_value(symbol) < amount:
+                raise ValueError(f"Insufficient position to sell {amount} {symbol}.")
+
+        # --- HERE IS THE FIX ---
+        # The timestamp is the 'name' of the Series, as it was the DataFrame's index.
+        timestamp = self._current_tick.name
+        # --- END OF FIX ---
+
+        self.portfolio.record_trade(
+            timestamp=timestamp,
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            price=price,
+            fee=fee
+        )
+        
+        return {
+            'id': f'sim_{len(self.portfolio.trades)}',
+            'status': 'filled',
+            'price': price,
+            'amount': amount,
+            'fee': fee
+        }
+```
+
+core/strategy.py
+```py
+# eops/core/strategy.py
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any
+
+# 导入所有新的处理器基类
+from .handler import (
+    BaseUpdater,
+    BaseEventHandler,
+    BaseDecider,
+    BaseExecutor
+)
+from eops.utils.logger import log
+
+class BaseStrategy(ABC):
+    """
+    Abstract Base Class for a strategy in the UADE pipeline architecture.
+    
+    A strategy is now defined as a container for the four key components
+    of the trading pipeline: Updaters, EventHandlers, Deciders, and Executors.
+    It holds the shared context and parameters for all its components.
+    """
+    def __init__(self, context: Dict[str, Any], params: Dict[str, Any]):
+        """
+        Initializes the strategy and its component processors.
+
+        Args:
+            context: Shared objects from the engine (e.g., exchange instances).
+            params: Strategy-specific parameters from the config file.
+        """
+        self.context: Dict[str, Any] = context
+        self.params: Dict[str, Any] = params
+        self.log = log
+        # This state dictionary can be used by all handlers for communication.
+        self.shared_state: Dict[str, Any] = {}
+
+        # The strategy's logic is now composed of these component lists.
+        # The user will implement the _create_* methods to populate them.
+        self.updaters: List[BaseUpdater] = self._create_updaters()
+        self.event_handlers: List[BaseEventHandler] = self._create_event_handlers()
+        self.deciders: List[BaseDecider] = self._create_deciders()
+        self.executors: List[BaseExecutor] = self._create_executors()
+        
+        # Validate that the essential components are provided.
+        if not self.updaters:
+            raise ValueError("A strategy must have at least one Updater.")
+        if not self.deciders:
+            raise ValueError("A strategy must have at least one Decider.")
+        if not self.executors:
+            raise ValueError("A strategy must have at least one Executor.")
+
+        log.info(f"Strategy '{self.__class__.__name__}' initialized with:")
+        log.info(f"  - {len(self.updaters)} Updater(s)")
+        log.info(f"  - {len(self.event_handlers)} EventHandler(s)")
+        log.info(f"  - {len(self.deciders)} Decider(s)")
+        log.info(f"  - {len(self.executors)} Executor(s)")
+
+    # --- User-Implementable Methods for Pipeline Construction ---
+
+    @abstractmethod
+    def _create_updaters(self) -> List[BaseUpdater]:
+        """
+        Must be implemented by the user to define the data sources.
+        Example: return [MyKlineUpdater(self)]
+        """
+        pass
+
+    def _create_event_handlers(self) -> List[BaseEventHandler]:
+        """
+        Optional. Implement to define data processing/analysis handlers.
+        Example: return [MyIndicatorHandler(self)]
+        """
+        return []
+
+    @abstractmethod
+    def _create_deciders(self) -> List[BaseDecider]:
+        """
+        Must be implemented by the user to define the decision-making logic.
+        Example: return [MySignalDecider(self)]
+        """
+        pass
+
+    @abstractmethod
+    def _create_executors(self) -> List[BaseExecutor]:
+        """
+        Must be implemented by the user to define the order execution logic.
+        Example: return [MyExecutionHandler(self)]
+        """
+        pass
+```
+
+data/clients/__init__.py
+```py
+# eops/data/clients/__init__.py
+from .base import BaseDataClient
+from .binance import BinanceClient
+from .okx import OkxClient
+
+# Add other clients here as you implement them
+# from .bybit import BybitClient
+
+SUPPORTED_CLIENTS = {
+    "binance": BinanceClient,
+    "okx": OkxClient,
+    # "bybit": BybitClient,
+}
+
+def get_data_client(exchange_id: str) -> BaseDataClient:
+    """
+    Factory function to get an instance of a data client for a given exchange.
+    """
+    client_class = SUPPORTED_CLIENTS.get(exchange_id.lower())
+    
+    if client_class:
+        return client_class()
+    else:
+        raise ValueError(
+            f"Exchange '{exchange_id}' is not supported for data download. "
+            f"Supported exchanges are: {list(SUPPORTED_CLIENTS.keys())}"
+        )
+```
+
+data/clients/base.py
+```py
+# eops/data/clients/base.py
+from abc import ABC, abstractmethod
+from typing import List
+
+class BaseDataClient(ABC):
+    """
+    Abstract Base Class for exchange data clients.
+    Defines the interface for fetching OHLCV data.
+    """
+    
+    @abstractmethod
+    def fetch_ohlcv(
+        self, 
+        symbol: str, 
+        timeframe: str, 
+        since: int, 
+        limit: int
+    ) -> List[list]:
+        """
+        Fetch OHLCV (Kline) data.
+
+        Args:
+            symbol (str): Unified symbol format, e.g., 'BTC/USDT'.
+            timeframe (str): Unified timeframe, e.g., '1h', '1d'.
+            since (int): The starting timestamp in milliseconds.
+            limit (int): The number of candles to fetch.
+
+        Returns:
+            A list of lists, where each inner list is [timestamp, open, high, low, close, volume].
+            Returns an empty list if no data is available.
+        """
+        pass
+```
+
+data/clients/binance.py
+```py
+# eops/data/clients/binance.py
+import requests
+from typing import List
+from .base import BaseDataClient
+from eops.utils.logger import log
+
+class BinanceClient(BaseDataClient):
+    """Data client for Binance."""
+    
+    BASE_URL = "https://api.binance.com"
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int) -> List[list]:
+        api_symbol = symbol.replace('/', '')
+        endpoint = f"{self.BASE_URL}/api/v3/klines"
+        
+        params = {
+            "symbol": api_symbol,
+            "interval": timeframe,
+            "startTime": since,
+            "limit": limit
+        }
+        
+        try:
+            response = requests.get(endpoint, params=params, timeout=10)
+            response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+            data = response.json()
+            
+            # Convert string data to numeric types
+            # Binance format: [open_time, open, high, low, close, volume, ...]
+            ohlcv = []
+            for d in data:
+                ohlcv.append([
+                    int(d[0]),      # timestamp
+                    float(d[1]),    # open
+                    float(d[2]),    # high
+                    float(d[3]),    # low
+                    float(d[4]),    # close
+                    float(d[5])     # volume
+                ])
+            return ohlcv
+            
+        except requests.exceptions.RequestException as e:
+            log.error(f"Binance API request failed: {e}")
+            return []
+        except Exception as e:
+            log.error(f"An error occurred while processing Binance data: {e}")
+            return []
+```
+
+data/clients/okx.py
+```py
+# eops/data/clients/okx.py (支持时间区间的最终版)
+
+import requests
+from typing import List, Optional
+from .base import BaseDataClient
+from eops.utils.logger import log
+
+class OkxClient(BaseDataClient):
+    """Data client for OKX."""
+    BASE_URL = "https://www.okx.com"
+    TIMEFRAME_MAP = {
+        '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
+        '1h': '1H', '2h': '2H', '4h': '4H', '1d': '1Dutc'
+    }
+
+    def _convert_timeframe_to_ms(self, timeframe: str) -> int:
+        """Converts timeframe string to milliseconds."""
+        multipliers = {'m': 60, 'h': 3600, 'd': 86400}
+        unit = timeframe[-1].lower()
+        value = int(timeframe[:-1])
+        return value * multipliers[unit] * 1000
+
+    def fetch_ohlcv(
+        self, 
+        symbol: str, 
+        timeframe: str, 
+        since: int, 
+        limit: int,
+        # 新增的参数，用于精确的区间请求
+        before_ts: Optional[int] = None 
+    ) -> List[list]:
+        """
+        Fetches OHLCV data. For OKX, this can use 'after' (since) and 'before' for precise ranges.
+        """
+        api_symbol = symbol.replace('/', '-')
+        api_timeframe = self.TIMEFRAME_MAP.get(timeframe)
+        if not api_timeframe:
+            raise ValueError(f"Timeframe '{timeframe}' not supported by OKX client. Supported: {list(self.TIMEFRAME_MAP.keys())}")
+
+        endpoint = f"{self.BASE_URL}/api/v5/market/history-candles"
+        
+        params = {
+            "instId": api_symbol,
+            "bar": api_timeframe,
+            "limit": str(limit) # OKX limit is 300
+        }
+        # OKX API: after and before are mutually exclusive, but we can use them for our logic.
+        # The downloader will call this function with either `since` or `before`.
+        # For our new strategy, we will use both to define a window.
+        if before_ts:
+            params["before"] = str(before_ts)
+        # `since` is mapped to `after`
+        params["after"] = str(since)
+
+        try:
+            req = requests.Request('GET', endpoint, params=params)
+            prepared = req.prepare()
+            log.debug(f"OKX Request URL: {prepared.url}")
+            
+            with requests.Session() as s:
+                response = s.send(prepared, timeout=10)
+
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get("code") != "0":
+                log.error(f"OKX API Error: {response_data.get('msg')} (Code: {response_data.get('code')})")
+                return []
+
+            data = response_data.get("data", [])
+            # Data is descending. Reverse it to be ascending (chrono).
+            data.reverse()
+            
+            ohlcv = [[int(d[0]), float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])] for d in data]
+            return ohlcv
+            
+        except requests.exceptions.RequestException as e:
+            log.error(f"OKX API request failed: {e}")
+            return []
+        except Exception as e:
+            log.error(f"An error occurred while processing OKX data: {e}", exc_info=True)
+            return []
+```
+
+data/downloader.py
+```py
+# eops/data/downloader.py
+import pandas as pd
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional, List
+import time
+
+from eops.utils.logger import log
+from eops.data.clients import get_data_client
+
+def _convert_timeframe_to_ms(timeframe: str) -> int:
+    """Converts timeframe string to milliseconds."""
+    try:
+        # 扩展支持 'w' for week
+        multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+        unit = timeframe[-1].lower()
+        if unit not in multipliers:
+            raise ValueError("Unsupported timeframe unit")
+        value = int(timeframe[:-1])
+        return value * multipliers[unit] * 1000
+    except Exception:
+        raise ValueError(f"Invalid timeframe format: '{timeframe}'. Use '1m', '5m', '1h', '4h', '1d', etc.")
+
+def _fetch_data_for_interval(
+    client, 
+    symbol: str, 
+    timeframe: str, 
+    start_ts: int, 
+    end_ts: int,
+    limit: int
+) -> List[list]:
+    """
+    Fetches all data within a given time interval using an iterative approach.
+    This function is robust and suitable for both full downloads and gap filling.
+    """
+    all_ohlcv = []
+    timeframe_ms = _convert_timeframe_to_ms(timeframe)
+    step_ms = limit * timeframe_ms
+    
+    current_ts = start_ts
+    while current_ts < end_ts:
+        try:
+            # We use `since` to set the start and `limit` to control the approximate end.
+            # `since=current_ts - 1` is a trick for APIs where 'since' or 'after' is exclusive.
+            ohlcv_chunk = client.fetch_ohlcv(
+                symbol=symbol,
+                timeframe=timeframe,
+                since=current_ts - 1,
+                limit=limit
+            )
+            
+            if ohlcv_chunk:
+                all_ohlcv.extend(ohlcv_chunk)
+
+        except Exception as e:
+            log.error(f"An error occurred during a fetch request: {e}")
+
+        # Advance timestamp by the fixed window size, not by the last timestamp in the chunk.
+        # This makes the process deterministic.
+        current_ts += step_ms
+        time.sleep(0.25) # Be respectful to the API, especially during intensive fixing.
+    
+    return all_ohlcv
+
+def download_ohlcv_data(
+    exchange_id: str,
+    symbol: str,
+    timeframe: str,
+    since: str,
+    output_path: Path,
+    until: Optional[str] = None,
+):
+    """Downloads historical OHLCV data for a specified date range."""
+    log.info(f"Attempting to download data for {symbol} on {exchange_id}...")
+
+    try:
+        client = get_data_client(exchange_id)
+    except (ValueError, KeyError) as e:
+        log.error(e)
+        return
+
+    since_ts = int(datetime.strptime(since, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+    until_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if until:
+        until_ts = int(datetime.strptime(until, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    limit = 300 if exchange_id.lower() == 'okx' else 1000
+    
+    log.info(f"Starting full download from {since} to {until or 'now'}")
+    all_ohlcv = _fetch_data_for_interval(client, symbol, timeframe, since_ts, until_ts, limit)
+
+    if not all_ohlcv:
+        log.error("Failed to download any data. Please check your parameters.")
+        return
+        
+    log.info(f"Downloaded {len(all_ohlcv)} total data points. Cleaning and saving...")
+
+    df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
+    
+    # Final, rigorous cleaning
+    df = df.sort_values(by='time').drop_duplicates(subset='time', keep='first')
+    df = df[(df['time'] >= pd.to_datetime(since_ts, unit='ms', utc=True)) & 
+              (df['time'] < pd.to_datetime(until_ts, unit='ms', utc=True))]
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
+    
+    log.info(f"💾 Successfully saved {len(df)} unique data points to: {output_path}")
+
+def fix_ohlcv_data(file_path: Path):
+    """
+    Finds and fills gaps in an existing OHLCV data file.
+    """
+    if not file_path.exists():
+        log.error(f"File not found: {file_path}")
+        return
+
+    # --- Robust Filename Parsing ---
+    filename = file_path.stem
+    parts = filename.split('_')
+    
+    if len(parts) < 3:
+        log.error(f"Filename '{filename}' does not match 'exchange_symbol_timeframe' format. It needs at least 3 parts separated by '_'.")
+        return
+        
+    exchange_id = parts[0]
+    timeframe = parts[-1]
+    # Re-join the middle parts to form the symbol, handling symbols with '_' or '-'
+    symbol = "_".join(parts[1:-1])
+    
+    log.info(f"Starting data fix for {file_path}")
+    log.info(f"  - Exchange: {exchange_id}, Symbol: {symbol}, Timeframe: {timeframe}")
+
+    # Load existing data
+    try:
+        df = pd.read_csv(file_path, parse_dates=['time'])
+        df = df.drop_duplicates(subset=['time']).set_index('time').sort_index()
+        log.info(f"Loaded {len(df)} existing data points from "
+                  f"{df.index.min().date()} to {df.index.max().date()}.")
+    except Exception as e:
+        log.error(f"Failed to load or parse CSV file: {e}")
+        return
+
+    if df.empty:
+        log.warning("File is empty. Cannot perform a fix.")
+        return
+
+    # Create a complete time index
+    try:
+        timeframe_freq = timeframe.replace('h', 'H').replace('d', 'D').replace('m', 'T')
+        start_date = df.index.min()
+        end_date = df.index.max()
+        full_index = pd.date_range(start=start_date, end=end_date, freq=timeframe_freq, tz='UTC')
+    except ValueError as e:
+        log.error(f"Could not determine frequency from timeframe '{timeframe}'. Error: {e}")
+        return
+    
+    # Find missing timestamps
+    missing_timestamps = full_index.difference(df.index)
+    
+    if missing_timestamps.empty:
+        log.info("✅ No gaps found in the data.")
+        return
+        
+    log.warning(f"Found {len(missing_timestamps)} missing timestamps.")
+
+    # Group consecutive missing timestamps into fetchable intervals
+    gaps = []
+    if not missing_timestamps.empty:
+        missing_series = missing_timestamps.to_series()
+        expected_freq = pd.to_timedelta(timeframe.replace('h', 'H'))
+        breaks = missing_series.diff() != expected_freq
+        groups = breaks.cumsum()
+        for _, group in missing_series.groupby(groups):
+            gaps.append((group.min(), group.max()))
+
+    log.info(f"Identified {len(gaps)} gaps to fill.")
+
+    # Fetch data for each gap
+    try:
+        client = get_data_client(exchange_id)
+        limit = 300 if exchange_id.lower() == 'okx' else 1000
+    except ValueError as e:
+        log.error(e)
+        return
+        
+    new_data = []
+    for i, (start_gap, end_gap) in enumerate(gaps, 1):
+        log.info(f"--- Fixing gap {i}/{len(gaps)}: "
+                 f"from {start_gap.strftime('%Y-%m-%d %H:%M:%S')} "
+                 f"to {end_gap.strftime('%Y-%m-%d %H:%M:%S')} ---")
+        
+        start_ts = int(start_gap.timestamp() * 1000)
+        end_ts = int(end_gap.timestamp() * 1000) + _convert_timeframe_to_ms(timeframe)
+        
+        chunk = _fetch_data_for_interval(client, symbol, timeframe, start_ts, end_ts, limit)
+        if chunk:
+            log.info(f"Fetched {len(chunk)} new data points for this gap.")
+            new_data.extend(chunk)
+
+    if not new_data:
+        log.warning("Could not fetch any new data to fill gaps.")
+        return
+
+    # Merge, clean, and save
+    new_df = pd.DataFrame(new_data, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    if not new_df.empty:
+        new_df['time'] = pd.to_datetime(new_df['time'], unit='ms', utc=True)
+    
+    combined_df = pd.concat([df.reset_index(), new_df])
+    final_df = combined_df.sort_values(by='time').drop_duplicates(subset='time', keep='first')
+    
+    final_df.to_csv(file_path, index=False)
+    log.info(f"💾 Successfully fixed data. Total data points now: {len(final_df)}. Saved to {file_path}")
+```
+
+utils/config_loader.py
+```py
+# eops/utils/config_loader.py
+import importlib.util
+from pathlib import Path
+from typing import Dict, Any
+
+def load_config_from_file(config_path: Path) -> Dict[str, Any]:
+    """
+    Dynamically loads a Python configuration file as a module.
+    """
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    spec = importlib.util.spec_from_file_location(name="eops_config", location=str(config_path))
+    if spec is None:
+        raise ImportError(f"Could not load spec for module at {config_path}")
+    
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+
+    # --- 修正配置加载逻辑 ---
+    try:
+        # STRATEGY_CLASS 是唯一在所有模式下都必需的
+        strategy_class = config_module.STRATEGY_CLASS
+
+        config = {
+            # 对于可选配置，使用 getattr 提供默认值 None
+            "exchange_class": getattr(config_module, "EXCHANGE_CLASS", None),
+            "exchange_params": getattr(config_module, "EXCHANGE_PARAMS", {}),
+            "strategy_class": strategy_class, # 必需项
+            "strategy_params": getattr(config_module, "STRATEGY_PARAMS", {}),
+            "engine_params": getattr(config_module, "ENGINE_PARAMS", {}),
+            "backtest_data_path": getattr(config_module, "BACKTEST_DATA_PATH", None)
+        }
+        return config
+    except AttributeError:
+        # 只有当最核心的 STRATEGY_CLASS 缺失时，才抛出异常
+        raise AttributeError(f"Missing required configuration 'STRATEGY_CLASS' in {config_path}")
+```
+
+utils/logger.py
+```py
+# eops/utils/logger.py
+import logging
+import sys
+
+def setup_logger():
+    """
+    Sets up a basic logger that prints to stdout.
+    This can be expanded to log to files, etc.
+    """
+    logger = logging.getLogger("eops")
+    
+    # Avoid adding handlers if they already exist
+    if logger.hasHandlers():
+        return logger
+        
+    logger.setLevel(logging.INFO)
+
+    # Create a handler to print to the console
+    handler = logging.StreamHandler(sys.stdout)
+    
+    # Create a formatter and set it for the handler
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    
+    # Add the handler to the logger
+    logger.addHandler(handler)
+    
+    return logger
+
+# Get a logger instance configured for the application
+log = setup_logger()
+```
+

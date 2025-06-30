@@ -1,0 +1,10 @@
+# eops/requirements.txt
+# Core dependencies for the Eops framework
+
+typer
+pandas
+quantstats
+requests
+
+# For live websocket connections
+websocket-client
